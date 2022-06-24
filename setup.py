@@ -1,5 +1,6 @@
 from setuptools import find_packages, setup
 
+
 setup(
     name="ising-transformers",
     packages=find_packages(exclude=[""]),
@@ -18,5 +19,13 @@ setup(
         "jaxopt>=0.4.2",
         "numpy>=1.19",
         "optax>=0.1.2",
+    ],
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: Apache Software License",
+        "Programming Language :: Python :: 3",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
 )
