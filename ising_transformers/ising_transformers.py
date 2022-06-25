@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from einops import rearrange, repeat
 from equinox import static_field
-from jax import grad, vmap
+from jax import value_and_grad, vmap
 from jax.numpy import einsum
 from jaxopt import AndersonAcceleration
 from jaxopt.base import IterativeSolver
@@ -19,26 +19,22 @@ from jaxopt.tree_util import tree_add, tree_sub
 @eqx.filter_jit
 def phi(t, h, beta, J):
     """Compute scalar `phi` given partition function parameters."""
-    # t = t.repeat(1, h.shape[-2]) if t.size(-1) == 1 else t
     V = jnp.diag(t) - J
     V_inv = jnp.linalg.solve(V, jnp.eye(V.shape[-1]))
     sign, logdet = jnp.linalg.slogdet(V)
-    fietje = (
+    return (
         beta * jnp.sum(t, axis=-1)
         - 0.5 * sign * logdet
         + beta / 4.0 * einsum("... i f, ... i j, ... j f -> ...", h, V_inv, h)
     )
-    return fietje
 
 
 @eqx.filter_jit
 def root_fun(t, h, beta, J):
-    bla = tree_add(_jac_phi(t, h, beta, J), t)
-    # jax.experimental.host_callback.id_print(bla)
-    return bla
+    return tree_add(_jac_phi(t, h, beta, J), t)
 
 
-@jax.jit
+@eqx.filter_jit
 def _jac_phi(t, h, beta, J):
     """Compute gradient of `phi` with respect to auxiliary variables `t`.
     For every example in the batch, the vector case with different auxiliary variables
@@ -56,7 +52,7 @@ def _jac_phi(t, h, beta, J):
     )
 
 
-@jax.jit
+@eqx.filter_jit
 def approximate_free_energy(t, h, beta, J):
     """Compute steepest-descent approximation of free energy for large vector dimension."""
     num_spins = h.shape[-2]
@@ -67,19 +63,24 @@ def approximate_free_energy(t, h, beta, J):
     )
 
 
-@jax.jit
-def solve_linear_system_fixed_point(A, v):
-    """Solve linear system A(u) = v.
+@eqx.filter_jit
+def solve_linear_system_fixed_point(matvec, v):
+    """Solve linear system matvec(u) = v.
 
     The solution u* of the system is the fixed point of:
-        T(u) = A(u) + u - v
+        T(u) = matvec(u) + u - v
     """
 
     def fixed_point_fun(u):
-        return tree_sub(tree_add(A(u), u), v)
+        return tree_sub(tree_add(matvec(u), u), v)
 
     bwd_solver = AndersonAcceleration(
-        fixed_point_fun=fixed_point_fun, tol=1e-3, jit=True, maxiter=20
+        fixed_point_fun=fixed_point_fun,
+        history_size=2,
+        ridge=1e-6,
+        beta=0.1,  # strong damping to prevent solution from jumping to other, dangerous local minima
+        tol=1e-4,
+        maxiter=200,
     )
     return bwd_solver.run(v)[0]
 
@@ -139,7 +140,7 @@ class IsingTransformerLayer(eqx.Module):
 
         self.solver = solver
 
-    def __call__(self, x, *, pos_emb, causal_mask):
+    def __call__(self, x, *, pos_emb=None, causal_mask=None):
         n = x.shape[-2]
 
         h = self.norm(x) / jnp.sqrt(self.dim_head)
@@ -159,7 +160,8 @@ class IsingTransformerLayer(eqx.Module):
 
         # apply rotary embeddings
 
-        q, k = map(lambda t: apply_rotary_pos_emb(t, pos_emb), (q, k))
+        if pos_emb is not None:
+            q, k = map(lambda t: apply_rotary_pos_emb(t, pos_emb), (q, k))
 
         h = rearrange(h, "... n (h d) -> ... h n d", h=self.heads)
 
@@ -168,7 +170,8 @@ class IsingTransformerLayer(eqx.Module):
             attn = einsum("... i d, ... j d -> ... i j", q, k) * self.scale
 
             # causal mask
-            attn = jnp.where(causal_mask, attn, self.neg_mask_value)
+            if causal_mask is not None:
+                attn = jnp.where(causal_mask, attn, self.neg_mask_value)
 
             # attention
             J = jax.nn.softmax(attn, axis=-1) / jnp.sqrt(n * self.dim_head)
@@ -182,12 +185,15 @@ class IsingTransformerLayer(eqx.Module):
             # print(h_head.shape, q.shape, k.shape)
             t0 = jnp.ones(*h_head.shape[:-1], dtype=h_head.dtype)
 
-            t_star = self.solver.run(t0, h=h_head, beta=self.beta, J=J)[0]
-            # print("BOING", t_star)
+            t_star = self.solver.run(t0, h_head, self.beta, J)[0]
+
+            jax.experimental.host_callback.id_print(t_star)
             # breakpoint()
-            return grad(approximate_free_energy, argnums=1)(
+            afetje, gradje = value_and_grad(approximate_free_energy, argnums=1)(
                 t_star, h_head, self.beta, J
             )
+            # print(afetje)
+            return gradje
 
         return rearrange(
             vmap(_single_head_fwd, in_axes=(0, 0, 0))(q, k, h),
@@ -206,7 +212,7 @@ def fixed_pos_embedding(inv_freq, seq):
     return jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
 
 
-@jax.jit
+@eqx.filter_jit
 def rotate_every_two(x):
     x = rearrange(x, "... (d r) -> ... d r", r=2)
     x1, x2 = x[..., 0], x[..., 1]
@@ -214,7 +220,7 @@ def rotate_every_two(x):
     return rearrange(x, "... d r -> ... (d r)")
 
 
-@jax.jit
+@eqx.filter_jit
 def apply_rotary_pos_emb(x, sincos):
     sin, cos = sincos
     return (x * cos) + (rotate_every_two(x) * sin)

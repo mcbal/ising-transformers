@@ -13,7 +13,7 @@ NUM_RUNS = 3
 
 key = jax.random.PRNGKey(0)
 model = IsingTransformer(
-    num_tokens=NUM_TOKENS, dim=512, depth=3, heads=8, dim_head=64, key=key
+    num_tokens=NUM_TOKENS, dim=512, depth=1, heads=8, dim_head=64, key=key
 )
 # print(jax.tree_map(lambda x: x.shape, model))
 print(sum(x.size for x in jax.tree_leaves(model)))
@@ -26,9 +26,9 @@ t = time.time()
 logits = model(seq).block_until_ready()  # (BATCH_SIZE, SEQ_LEN, NUM_TOKENS)
 print(f"Including just-in-time compilation {time.time()-t}")
 
-for seq_key in seq_keys[1:]:
-    seq = random.randint(seq_key, (BATCH_SIZE, SEQ_LEN), 0, NUM_TOKENS)
-    print(seq)
-    t = time.time()
-    logits = model(seq).block_until_ready()  # (1, 32, 10)
-    print(f"Excluding just-in-time compilation {time.time()-t}")
+# for seq_key in seq_keys[1:]:
+#     seq = random.randint(seq_key, (BATCH_SIZE, SEQ_LEN), 0, NUM_TOKENS)
+#     print(seq)
+#     t = time.time()
+#     logits = model(seq).block_until_ready()  # (1, 32, 10)
+#     print(f"Excluding just-in-time compilation {time.time()-t}")
