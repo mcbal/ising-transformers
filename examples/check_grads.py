@@ -5,7 +5,11 @@ from jax import random, vmap
 from jax.test_util import check_grads
 from jaxopt import AndersonAcceleration
 
-from ising_transformers.ising_transformers import IsingTransformerLayer, root_fun, solve_linear_system_fixed_point
+from ising_transformers.ising_transformers import (
+    IsingTransformerLayer,
+    root_fun,
+    solve_linear_system_fixed_point,
+)
 
 
 NUM_TOKENS = 10

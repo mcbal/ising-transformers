@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from einops import rearrange, repeat
 from equinox import static_field
-from jax import value_and_grad, vmap
+from jax import grad, vmap
 from jax.numpy import einsum
 from jaxopt import AndersonAcceleration
 from jaxopt.base import IterativeSolver
@@ -17,10 +17,15 @@ from jaxopt.tree_util import tree_add, tree_sub
 
 
 @eqx.filter_jit
-def phi(t, h, beta, J):
-    """Compute scalar `phi` given partition function parameters."""
+def _phi_covar_inv(t, J):
     V = jnp.diag(t) - J
     V_inv = jnp.linalg.solve(V, jnp.eye(V.shape[-1]))
+    return V, V_inv
+
+
+@eqx.filter_jit
+def _phi(t, h, beta, J):
+    V, V_inv = _phi_covar_inv(t, J)
     sign, logdet = jnp.linalg.slogdet(V)
     return (
         beta * jnp.sum(t, axis=-1)
@@ -30,25 +35,12 @@ def phi(t, h, beta, J):
 
 
 @eqx.filter_jit
-def root_fun(t, h, beta, J):
-    return tree_add(_jac_phi(t, h, beta, J), t)
-
-
-@eqx.filter_jit
 def _jac_phi(t, h, beta, J):
-    """Compute gradient of `phi` with respect to auxiliary variables `t`.
-    For every example in the batch, the vector case with different auxiliary variables
-    for every spin yields a vector whereas the scalar case with identical auxiliary
-    variables for every spin yields just a scalar.
-    """
-    V = jnp.diag(t) - J
-    V_inv = jnp.linalg.solve(V, jnp.eye(V.shape[-1]))
+    _, V_inv = _phi_covar_inv(t, J)
     return (
         beta * jnp.ones_like(t)
         - 0.5 * jnp.diagonal(V_inv, axis1=-2, axis2=-1)
-        - beta
-        / 4.0
-        * einsum("... j i, ... j f, ... k f, ... i k -> ... i", V_inv, h, h, V_inv)
+        - beta / 4.0 * einsum("... j i, ... j f, ... k f, ... i k -> ... i", V_inv, h, h, V_inv)
     )
 
 
@@ -56,21 +48,16 @@ def _jac_phi(t, h, beta, J):
 def approximate_free_energy(t, h, beta, J):
     """Compute steepest-descent approximation of free energy for large vector dimension."""
     num_spins = h.shape[-2]
-    return (
-        -1.0
-        / beta
-        * (-0.5 * num_spins * (1.0 + jnp.log(2.0 * beta)) + phi(t, h, beta, J))
-    )
+    return -1.0 / beta * (-0.5 * num_spins * (1.0 + jnp.log(2.0 * beta)) + _phi(t, h, beta, J))
+
+
+@eqx.filter_jit
+def root_fun(t, h, beta, J):
+    return tree_add(_jac_phi(t, h, beta, J), t)
 
 
 @eqx.filter_jit
 def solve_linear_system_fixed_point(matvec, v):
-    """Solve linear system matvec(u) = v.
-
-    The solution u* of the system is the fixed point of:
-        T(u) = matvec(u) + u - v
-    """
-
     def fixed_point_fun(u):
         return tree_sub(tree_add(matvec(u), u), v)
 
@@ -78,7 +65,7 @@ def solve_linear_system_fixed_point(matvec, v):
         fixed_point_fun=fixed_point_fun,
         history_size=2,
         ridge=1e-6,
-        beta=0.1,  # strong damping to prevent solution from jumping to other, dangerous local minima
+        beta=0.1,  # strong damping to prevent solution from jumping to other local minima
         tol=1e-4,
         maxiter=200,
     )
@@ -145,20 +132,8 @@ class IsingTransformerLayer(eqx.Module):
 
         h = self.norm(x) / jnp.sqrt(self.dim_head)
 
-        # h = rearrange(h, "... n (h d) -> ... h n d", h=self.heads)
-
-        # h2 = rearrange(h, "... h n d -> ... n (h d)", h=self.heads)
-
-        # fused attention and feedforward projections
-
-        q, k = jax.vmap(self.to_q)(h), jax.vmap(self.to_k)(h)
-
-        # split out heads
-
-        q = rearrange(q, "... n (h d) -> ... h n d", h=self.heads)
-        k = rearrange(k, "... n (h d) -> ... h n d", h=self.heads)
-
-        # apply rotary embeddings
+        q = rearrange(jax.vmap(self.to_q)(h), "... n (h d) -> ... h n d", h=self.heads)
+        k = rearrange(jax.vmap(self.to_k)(h), "... n (h d) -> ... h n d", h=self.heads)
 
         if pos_emb is not None:
             q, k = map(lambda t: apply_rotary_pos_emb(t, pos_emb), (q, k))
@@ -166,34 +141,16 @@ class IsingTransformerLayer(eqx.Module):
         h = rearrange(h, "... n (h d) -> ... h n d", h=self.heads)
 
         def _single_head_fwd(q, k, h_head):
-            # contract
             attn = einsum("... i d, ... j d -> ... i j", q, k) * self.scale
 
-            # causal mask
             if causal_mask is not None:
                 attn = jnp.where(causal_mask, attn, self.neg_mask_value)
 
-            # attention
             J = jax.nn.softmax(attn, axis=-1) / jnp.sqrt(n * self.dim_head)
 
-            # aggregate values
-            # print(J)
-
-            # out = einsum("... h i j, ... j d -> ... h i d", attn, v)
-
-            # Solve for stationary point of exponential appearing in partition function.
-            # print(h_head.shape, q.shape, k.shape)
             t0 = jnp.ones(*h_head.shape[:-1], dtype=h_head.dtype)
-
             t_star = self.solver.run(t0, h_head, self.beta, J)[0]
-
-            jax.experimental.host_callback.id_print(t_star)
-            # breakpoint()
-            afetje, gradje = value_and_grad(approximate_free_energy, argnums=1)(
-                t_star, h_head, self.beta, J
-            )
-            # print(afetje)
-            return gradje
+            return grad(approximate_free_energy, argnums=1)(t_star, h_head, self.beta, J)
 
         return rearrange(
             vmap(_single_head_fwd, in_axes=(0, 0, 0))(q, k, h),
@@ -240,7 +197,7 @@ class IsingTransformer(eqx.Module):
     final_norm: eqx.Module
 
     def __init__(self, *, num_tokens, dim, dim_head, depth, heads, key):
-        self.embedding = jrandom.normal(key, (num_tokens, dim)) * 0.02
+        self.embedding = 0.02 * jrandom.normal(key, (num_tokens, dim))
         self.inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim_head, 2) / dim_head))
 
         solver = AndersonAcceleration(
@@ -248,7 +205,7 @@ class IsingTransformer(eqx.Module):
             history_size=2,
             ridge=1e-6,
             maxiter=20,
-            beta=0.1,  # strong damping to prevent solution from jumping to other, dangerous local minima
+            beta=0.1,  # strong damping to prevent solution from jumping to other local minima
             tol=1e-4,
             jit=True,
             implicit_diff=True,
@@ -256,10 +213,7 @@ class IsingTransformer(eqx.Module):
         )
 
         self.layers = [
-            IsingTransformerLayer(
-                dim=dim, dim_head=dim_head, heads=heads, key=key, solver=solver
-            )
-            for _ in range(depth)
+            IsingTransformerLayer(dim=dim, dim_head=dim_head, heads=heads, key=key, solver=solver) for _ in range(depth)
         ]
         self.final_norm = eqx.nn.LayerNorm(dim)
 
