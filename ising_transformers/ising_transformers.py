@@ -9,9 +9,7 @@ from equinox import static_field
 from jax import grad, vmap
 from jax.numpy import einsum
 from jaxopt import AndersonAcceleration
-from jaxopt.base import IterativeSolver
-from jaxopt.tree_util import tree_add, tree_sub
-
+from jaxopt.tree_util import tree_add
 
 # Ising transformer layer: helper functions.
 
@@ -45,31 +43,32 @@ def _jac_phi(t, h, beta, J):
 
 
 @eqx.filter_jit
-def approximate_free_energy(t, h, beta, J):
-    """Compute steepest-descent approximation of free energy for large vector dimension."""
-    num_spins = h.shape[-2]
-    return -1.0 / beta * (-0.5 * num_spins * (1.0 + jnp.log(2.0 * beta)) + _phi(t, h, beta, J))
-
-
-@eqx.filter_jit
 def root_fun(t, h, beta, J):
     return tree_add(_jac_phi(t, h, beta, J), t)
+    # return tree_add(grad(_phi)(t, h, beta, J), t)
 
 
 @eqx.filter_jit
-def solve_linear_system_fixed_point(matvec, v):
-    def fixed_point_fun(u):
-        return tree_sub(tree_add(matvec(u), u), v)
-
-    bwd_solver = AndersonAcceleration(
-        fixed_point_fun=fixed_point_fun,
+def t_star(h, beta, J):
+    solver = AndersonAcceleration(
+        fixed_point_fun=root_fun,
         history_size=2,
         ridge=1e-6,
+        maxiter=20,
         beta=0.1,  # strong damping to prevent solution from jumping to other local minima
         tol=1e-4,
-        maxiter=200,
+        jit=True,
+        implicit_diff=True,
     )
-    return bwd_solver.run(v)[0]
+    t_init = jnp.ones(*h.shape[:-1], dtype=h.dtype)
+    return solver.run(t_init, h, beta, J)[0]
+
+
+@eqx.filter_jit
+def log_Z(h, beta, J):
+    """Compute steepest-descent approximation of log(Z) for large vector dimension."""
+    num_spins = h.shape[-2]
+    return -0.5 * num_spins * (1.0 + jnp.log(2.0 * beta)) + _phi(t_star(h, beta, J), h, beta, J)
 
 
 # Ising transformer layer: module class.
@@ -89,7 +88,6 @@ class IsingTransformerLayer(eqx.Module):
     norm: eqx.Module
     to_q: eqx.Module
     to_k: eqx.Module
-    solver: IterativeSolver = static_field()
 
     heads: int = static_field()
     scale: float = static_field()
@@ -104,7 +102,6 @@ class IsingTransformerLayer(eqx.Module):
         key,
         neg_mask_value=-1e10,
         beta=1.0,
-        solver,
         solver_fwd_max_iter=20,
         solver_fwd_tol=1e-3,
         solver_bwd_max_iter=20,
@@ -125,37 +122,46 @@ class IsingTransformerLayer(eqx.Module):
         self.scale = dim_head**-0.5
         self.neg_mask_value = neg_mask_value
 
-        self.solver = solver
-
     def __call__(self, x, *, pos_emb=None, causal_mask=None):
-        n = x.shape[-2]
+        x = self.norm(x) / jnp.sqrt(self.dim_head)
 
-        h = self.norm(x) / jnp.sqrt(self.dim_head)
+        x = rearrange(x, "... n (h d) -> ... h n d", h=self.heads)
 
-        q = rearrange(jax.vmap(self.to_q)(h), "... n (h d) -> ... h n d", h=self.heads)
-        k = rearrange(jax.vmap(self.to_k)(h), "... n (h d) -> ... h n d", h=self.heads)
+        def _magnetizations(x, beta):
+            x = rearrange(x, "...  h n d -> ... n (h d)", h=self.heads)
 
-        if pos_emb is not None:
-            q, k = map(lambda t: apply_rotary_pos_emb(t, pos_emb), (q, k))
+            q = rearrange(jax.vmap(self.to_q)(x), "... n (h d) -> ... h n d", h=self.heads)
+            k = rearrange(jax.vmap(self.to_k)(x), "... n (h d) -> ... h n d", h=self.heads)
 
-        h = rearrange(h, "... n (h d) -> ... h n d", h=self.heads)
+            if pos_emb is not None:
+                q, k = map(lambda t: apply_rotary_pos_emb(t, pos_emb), (q, k))
 
-        def _single_head_fwd(q, k, h_head):
-            attn = einsum("... i d, ... j d -> ... i j", q, k) * self.scale
+            x = rearrange(x, "... n (h d) -> ... h n d", h=self.heads)
 
-            if causal_mask is not None:
-                attn = jnp.where(causal_mask, attn, self.neg_mask_value)
+            def _log_Z_head(
+                x,
+                q,
+                k,
+            ):
+                attn = einsum("... i d, ... j d -> ... i j", q, k)  # * self.dim_head**-0.5
 
-            J = jax.nn.softmax(attn, axis=-1) / jnp.sqrt(n * self.dim_head)
+                if causal_mask is not None:
+                    attn = jnp.where(causal_mask, attn, self.neg_mask_value)
 
-            t0 = jnp.ones(*h_head.shape[:-1], dtype=h_head.dtype)
-            t_star = self.solver.run(t0, h_head, self.beta, J)[0]
-            return grad(approximate_free_energy, argnums=1)(t_star, h_head, self.beta, J)
+                J = jax.nn.softmax(attn, axis=-1) / jnp.sqrt(x.shape[-2] * self.dim_head)
+
+                return log_Z(x, beta, J)
+
+            return vmap(
+                grad(_log_Z_head),
+                in_axes=(0, 0, 0),
+            )(x, q, k)
 
         return rearrange(
-            vmap(_single_head_fwd, in_axes=(0, 0, 0))(q, k, h),
+            _magnetizations(x, self.beta),
             "... h n d -> ... n (h d)",
             h=self.heads,
+            n=x.shape[-2],
         )
 
 
@@ -200,21 +206,8 @@ class IsingTransformer(eqx.Module):
         self.embedding = 0.02 * jrandom.normal(key, (num_tokens, dim))
         self.inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim_head, 2) / dim_head))
 
-        solver = AndersonAcceleration(
-            fixed_point_fun=root_fun,
-            history_size=2,
-            ridge=1e-6,
-            maxiter=20,
-            beta=0.1,  # strong damping to prevent solution from jumping to other local minima
-            tol=1e-4,
-            jit=True,
-            implicit_diff=True,
-            implicit_diff_solve=solve_linear_system_fixed_point,
-        )
-
-        self.layers = [
-            IsingTransformerLayer(dim=dim, dim_head=dim_head, heads=heads, key=key, solver=solver) for _ in range(depth)
-        ]
+        # split key so layers dont start out identical
+        self.layers = [IsingTransformerLayer(dim=dim, dim_head=dim_head, heads=heads, key=key) for _ in range(depth)]
         self.final_norm = eqx.nn.LayerNorm(dim)
 
     def __call__(self, x):
@@ -226,6 +219,7 @@ class IsingTransformer(eqx.Module):
 
         for layer in self.layers:
             x = layer(x, pos_emb=rotary_emb, causal_mask=causal_mask)
+            print(x)
 
         x = self.final_norm(x)
         out = x @ self.embedding.transpose()
